@@ -1,0 +1,11 @@
+# core (CPU-runnable). versions match what's tested; transformers 5.x renamed the
+# load dtype kwarg to `dtype`, so <5 will break the worker.
+torch>=2.2
+transformers>=5,<6
+safetensors
+huggingface_hub
+numpy
+
+# GPU-only extras live in [gpu] in pyproject.toml: accelerate, bitsandbytes, vllm.
+# install those in Colab, not here — bitsandbytes has no CPU wheel worth having and
+# vllm pulls a large CUDA stack.

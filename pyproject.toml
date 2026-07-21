@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldstart-lab"
+version = "0.2.0"
+description = "Phase-decomposed cold-start benchmarking for LLM inference"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers>=5,<6",
+    "safetensors",
+    "huggingface_hub",
+    "numpy",
+]
+
+[project.optional-dependencies]
+gpu = ["accelerate", "bitsandbytes", "vllm"]
+dev = ["pytest"]
+
+[project.scripts]
+coldstart = "coldstart.cli:main"
+
+[tool.setuptools]
+packages = ["coldstart"]
