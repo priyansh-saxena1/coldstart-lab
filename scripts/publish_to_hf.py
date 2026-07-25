@@ -147,7 +147,7 @@ because the bottleneck has moved.
 | File | Contents |
 |---|---|
 | `observations.csv` | One row per (model, experiment, condition), joined to checkpoint size, parameter count, shard count and family. |
-| `runs.json` | The raw merged ledger, unmodified, so all statistics can be recomputed from source. |
+| `raw/runs.json` | The raw merged ledger, unmodified, so all statistics can be recomputed from source. |
 | `cross_model_report.md` | The generated analysis: scaling fits, per-model tables, projections, noise profile, limitations. |
 
 ## Columns
@@ -259,7 +259,7 @@ def main(argv=None) -> int:
 
     if os.path.exists(args.out_dir):
         shutil.rmtree(args.out_dir)
-    info = export(merged, args.out_dir)
+        info = export(merged, args.out_dir)
     print(f"wrote {info['n_rows']} observation rows -> {info['observations_csv']}")
 
     obs = observations_from_merged(merged)
@@ -267,6 +267,15 @@ def main(argv=None) -> int:
     with open(report_path, "w") as fh:
         fh.write(build_report(obs))
     print(f"wrote analysis -> {report_path}")
+
+    # Move runs.json into raw/ to avoid HF viewer 500 from auto-scanning it
+    runs_src = os.path.join(args.out_dir, "runs.json")
+    raw_dir = os.path.join(args.out_dir, "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    runs_dst = os.path.join(raw_dir, "runs.json")
+    if os.path.exists(runs_src):
+        shutil.move(runs_src, runs_dst)
+        print(f"moved runs.json -> {runs_dst}")
 
     card_path = os.path.join(args.out_dir, "README.md")
     with open(card_path, "w") as fh:
