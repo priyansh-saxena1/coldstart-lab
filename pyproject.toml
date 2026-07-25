@@ -1,26 +1,43 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "coldstart-lab"
-version = "0.2.0"
-description = "Phase-decomposed cold-start benchmarking for LLM inference"
+version = "0.1.0"
+description = "A benchmarking harness for LLM container cold-start latency."
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Priyansh Saxena" }]
+keywords = ["llm", "inference", "cold-start", "benchmark", "vllm", "serverless"]
+
 dependencies = [
-    "torch",
-    "transformers>=5,<6",
-    "safetensors",
-    "huggingface_hub",
-    "numpy",
+    "torch>=2.1",
+    "transformers>=4.40",
+    "safetensors>=0.4",
+    "huggingface_hub>=0.23",
 ]
 
 [project.optional-dependencies]
-gpu = ["accelerate", "bitsandbytes", "vllm"]
-dev = ["pytest"]
+# Distributed fleet: N Colab sessions sharing one Postgres ledger.
+distributed = ["sqlalchemy>=2.0", "psycopg2-binary>=2.9"]
+gpu = ["vllm>=0.5"]
+plots = ["matplotlib>=3.7"]
+dev = ["pytest>=8.0", "pytest-cov>=4.0"]
 
 [project.scripts]
-coldstart = "coldstart.cli:main"
+coldstart-lab = "coldstart_lab.cli:main"
+coldstart-fleet = "coldstart_lab.distributed.cli:main"
 
-[tool.setuptools]
-packages = ["coldstart"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "gpu: requires a CUDA device",
+    "network: downloads a real checkpoint from the HF hub",
+    "postgres: exercises the ledger against a real Postgres server",
+]

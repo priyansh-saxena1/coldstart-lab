@@ -1,116 +1,316 @@
 # coldstart-lab
 
-Phase-decomposed cold-start benchmarking for open-source LLM inference.
+A benchmarking harness for **LLM container cold-start latency** — the time a
+serverless / scale-to-zero inference platform pays to bring a model up from
+nothing before it can serve a first token.
 
-The premise: "cold start" is not a single number. On a scale-from-zero event the
-time-to-first-token is a sum of phases, and which phase dominates changes with the
-model size, the storage tier the weights live on, the checkpoint format, and the
-inference engine. Optimizing the wrong phase buys you nothing. This tool measures
-the phases separately, sweeps them across model sizes, and extrapolates the load
-curve to production sizes so the measurement is actually decision-useful.
+The harness decomposes cold start into the phases that actually move the needle
+and measures each in isolation, on a **free-tier CPU or a single consumer GPU**,
+then extrapolates the results to production model sizes with a stated error
+model. It is built to answer a concrete platform question: *given our storage
+tier, checkpoint format, and engine, where is cold-start time going, and which
+lever is worth pulling first?*
 
-Phases measured (transformers backend):
+## Why the phases matter
+
+Cold start is a composite, and the dominant term shifts with the setup:
 
 ```
-pull(stage_copy) -> import -> weight-load -> tokenizer -> to_device -> first_forward
+cold_start = pull            (weights leave storage)
+           + deserialize     (bytes become tensors in host RAM)
+           + to_device       (tensors cross PCIe to the GPU)
+           + engine_bringup  (CUDA context, JIT/kernel warm-up,
+                              CUDA-graph capture, KV-cache allocation)
 ```
 
-For vLLM the internals are opaque (weight load, JIT, CUDA-graph capture and
-KV-cache alloc happen inside one call), so there we time `import -> engine_init ->
-first_request` and toggle the one knob that matters for cold start:
-`enforce_eager`, which skips CUDA-graph capture.
+Optimising the wrong term is a common failure mode — memory-snapshotting an
+engine that is actually bottlenecked on weight transfer buys nothing. This
+harness measures the terms separately so the optimisation follows the data.
 
-## Why the numbers are honest
+## What it measures
 
-Two things sink most naive cold-start benchmarks, and both are handled here:
+| Experiment | Question | Runs on |
+|---|---|---|
+| `checkpoint_format` | safetensors (mmap / no-mmap) vs legacy pickled `.bin`, identical weights | CPU or GPU |
+| `storage_tier` | local NVMe vs network-attached (real Drive mount or emulated bandwidth ceiling) | CPU or GPU |
+| `engine_init` | transformers init→load→first-forward; on GPU, vLLM `enforce_eager` vs CUDA-graph capture | CPU (transformers) / GPU (vLLM) |
+| extrapolation | project measured MiB/s onto 32B / 70B production checkpoints | anywhere |
 
-- **Warm page cache masquerading as cold.** Load a model twice in one process and
-  the second load reads weights from RAM, not storage. Every measurement runs in a
-  **fresh subprocess** (`coldstart/worker.py`) and the OS page cache is dropped
-  between runs (`storage.drop_page_cache`, best-effort — needs root; it warns
-  loudly if it can't so you don't quote warm numbers as cold).
-- **First-run overhead attributed to the model.** The first cold start on a box
-  also pays for the first-ever CUDA context, kernel autotune caches, and hub
-  metadata. One discarded warmup run absorbs that.
+Every experiment repeats each condition, discards warm-ups, drops the OS page
+cache between trials (or falls back to `posix_fadvise` and says so), and reports
+**p50 / p95**, not just a mean — because a scale-to-zero SLA is written against
+the tail.
 
-## Quickstart
-
-CPU smoke run (tiny models, no GPU, ~2 min) — verifies the whole pipeline:
+## Install
 
 ```bash
 pip install -e .
-python scripts/smoke.py
+# optional extras:
+pip install -e ".[gpu]"     # vLLM engine experiment
+pip install -e ".[plots]"   # matplotlib charts in the report
+pip install -e ".[dev]"     # pytest
+pip install -e ".[distributed]"  # multi-session Postgres fleet
 ```
 
-On a Colab T4: open `notebooks/coldstart_bench.ipynb`, upload this repo as a zip,
-run top to bottom. It does the size sweep, the storage-tier / quantization /
-engine experiments, plots the phase breakdown, and saves `results.json`.
+Requires Python ≥ 3.10, and torch / transformers / safetensors (already present
+on Colab).
 
-CLI sweep:
+## Quick start
 
 ```bash
-python -m coldstart.cli sweep --preset t4 --device cuda:0 --dtype float16 --out results.json
+# Fast CPU smoke run on random weights — no real checkpoint downloaded:
+coldstart-lab --model tiny-llama-random --device cpu --skip-engine \
+    --repeats 2 --warmup 1 --out-dir ./out
+
+# Real micro study on a CPU:
+coldstart-lab --model smollm2-135m --device cpu --out-dir ./out
+
+# Core GPU study on Colab (T4/L4):
+coldstart-lab --model qwen2.5-3b --device cuda --out-dir ./out
+
+# Show that 4-bit cuts load time, not just memory:
+coldstart-lab --model qwen2.5-7b     --device cuda --skip-bin --out-dir ./out
+coldstart-lab --model qwen2.5-7b-awq --device cuda --skip-bin --out-dir ./out
 ```
 
-## The experiments (`coldstart/experiments.py`)
+Each run writes `<model>_report.json`, `<model>_report.md`, and PNG charts.
 
-| experiment | what it isolates | needs GPU |
-|---|---|---|
-| `storage_tier` | network-attached vs local disk (Drive vs NVMe on Colab) | no |
-| `checkpoint_format` | safetensors mmap vs legacy `.bin` pickle | no |
-| `quantization` | fp16 vs bitsandbytes 4-bit: load time + footprint | yes |
-| `engine_cuda_graphs` | vLLM init with vs without CUDA-graph capture | yes |
-| `sleep_wake` | vLLM sleep/wake as an OSS proxy for snapshot/restore | yes (stub) |
+### Colab
 
-The size sweep on its own fits `load_s ~ slope·GB + intercept`; `slope` is
-1/effective-bandwidth and the intercept is size-independent overhead. That fit is
-what powers `report.extrapolate(...)` to production sizes. R² is reported so you
-can see how far to trust the line.
+Open `notebooks/coldstart_lab_colab.ipynb`. It unzips/clones the repo, installs,
+prints the environment fingerprint and model registry, and walks through all
+three experiments plus extrapolation. Set the runtime to a T4 for the GPU study.
 
-## Model catalog (`coldstart/models.py`)
+## Model registry — 61 models, 28 architecture families
 
-Chosen to give a clean size-scaling curve in one arch family (Pythia 70M–1.4B,
-Qwen2.5 0.5B–7B) that fits a 16 GB T4, plus tiny CPU-runnable models for CI, plus
-one 7B to make the storage/format/quant deltas unambiguous (they're tens of ms at
-0.5B, seconds at 7B). Gated production models (Llama 3.2, Gemma-2, Mistral-7B) are
-included but opt-in behind a HF token.
+Grouped by **weight footprint**, since that is what cold start scales with
+(`coldstart_lab/models.py`):
 
-## What this does *not* claim to measure
+| Tier | Models | Size range | Runs on |
+|---|---:|---|---|
+| `ci` | 1 | ~4 MB | test suite, no network |
+| `micro` | 6 | 0.25–0.92 GiB | free CPU runtime |
+| `small` | 26 | 1.0–7.5 GiB | T4 (15 GiB) with staging headroom |
+| `medium` | 20 | 9.3–22.8 GiB | L4 / A100, or quantized |
+| `reference` | 8 | 26–135 GiB | **never downloaded** — extrapolation targets |
 
-- It measures single-process transformers loads and single-node vLLM init. It does
-  **not** model multi-GPU tensor-parallel sharding, where load parallelizes across
-  ranks and the curve above stops being linear — flagged rather than faked.
-- Colab's Drive mount is FUSE-backed, so the "network-attached" tier includes the
-  FUSE layer's own caching. That's arguably close to what a shared FS does, but
-  it's not a clean block-device page-cache drop; the storage-tier numbers carry
-  that caveat.
-- The driver-level GPU memory snapshot that Modal/InferX use (CUDA checkpoint API)
-  is proprietary; `sleep_wake` approximates it with vLLM's sleep mode, which is a
-  different mechanism and only a proxy.
+Families include Qwen2.5, Qwen3 (incl. a 30B MoE), Phi-2/3/3.5/4, SmolLM2/3,
+Pythia, GPT-2, BLOOM, TinyLlama, StableLM, Falcon/Falcon3, OLMo-2, Granite,
+InternLM, Yi, DeepSeek + R1-Distill, Zephyr, OpenHermes, SOLAR, GLM-4 and
+Mistral — plus matched AWQ/GPTQ 4-bit pairs for `Qwen2.5-7B/14B/32B`, which are
+the cleanest experiment available: identical architecture and parameter count,
+different bytes on disk.
 
-## Layout
+**Every entry is verified, not estimated.** Sizes, shard counts and gating status
+were read from the Hugging Face API, not recalled from memory:
 
+```bash
+python scripts/verify_registry.py            # all 61
+python scripts/verify_registry.py --tier small --fix
 ```
-coldstart/
-  timing.py       phase timer + p50/p95 summarization
-  worker.py       one isolated cold load, prints phase JSON (run as a subprocess)
-  runner.py       spawns workers, drops cache, repeats, collects
-  storage.py      stage weights onto a tier, drop page cache
-  models.py       catalog + T4 preset
-  experiments.py  the five experiments
-  report.py       curve fit + extrapolation + arm diffing
-  cli.py          `coldstart sweep`
-tests/            timing math, curve fit, worker-output parsing
-notebooks/        Colab driver
-scripts/smoke.py  CPU end-to-end check
+
+Two Mistral repos ship a `consolidated.safetensors` copy *alongside* the shards —
+the same tensors twice. A naive `snapshot_download` fetches both and doubles the
+pull for nothing; those are tagged `dup-representation` and sized by shards only.
+
+No gated repos are included, by policy — see the fleet notes above.
+
+## Cross-model analysis
+
+`coldstart_lab.analysis` turns a fleet's ledger into findings that only appear
+once many models are measured. `coldstart-fleet merge` writes it automatically:
+
+```bash
+coldstart-fleet merge --out ./merged   # -> merged_results.json + cross_model_report.md
 ```
+
+The report covers: coverage; whether load time is linear in checkpoint size
+(least-squares fit per condition, reporting slope as ms/GiB, the size-independent
+floor as an intercept, and R²); safetensors-vs-pickle speedup across every model;
+what 4-bit buys at *load* time versus its size ratio; per-shard fixed cost;
+storage-tier throughput; engine bring-up; a projection to 32B/72B; a run-to-run
+noise profile; and limitations.
+
+Two deliberate design choices worth knowing:
+
+- **The projection basis is chosen by R², not by the fastest slope.** A fit can
+  look fast simply because it is a bad fit. If no condition clears R² ≥ 0.80 the
+  report prints *"Do not quote these numbers"* above the table rather than
+  emitting a confident-looking projection built on noise.
+- **Every effect is reported against the measured noise floor.** An effect
+  smaller than the run-to-run spread is not a finding, and the report says so.
+
+
+
+## Design notes
+
+- **Loaders** (`coldstart_lab/loaders/`) are swappable and share one driver loop,
+  so any measured delta is attributable to the loading strategy, not the harness.
+  A local converter derives a byte-identical `.bin` from safetensors so the
+  format A/B holds the same weights.
+- **Cold reads are real**: `environment.drop_page_cache` evicts cached pages
+  system-wide when privileged, else `posix_fadvise(DONTNEED)` per file; the mode
+  is recorded in the report.
+- **Emulated storage tiers can only slow a read down**, never speed it up, so
+  emulation cannot manufacture a favourable result. Emulated rows are labelled.
+- **Extrapolation is linear in bytes** and explicitly surfaces its assumptions
+  (ignores fixed per-file overhead; assumes matched per-byte characteristics).
+
+## Distributed mode: N Colab sessions, one Postgres ledger
+
+Free-tier sessions are slow and pre-emptible, so the practical way to cover a
+whole model tier is to run several at once. `coldstart_lab.distributed` fans the
+task list across as many sessions as you can open, coordinating through a single
+Postgres database (Neon's free tier is enough).
+
+```bash
+# once, from any session:
+coldstart-fleet init --tier small --device-class t4
+
+# in every session:
+coldstart-fleet work --device cuda --device-class t4
+
+# from anywhere:
+coldstart-fleet status --watch
+coldstart-fleet merge --out ./merged
+```
+
+The unit of work is one `(model, experiment, device_class)` triple. Device class
+is part of the *identity*, not metadata: a T4 number is not interchangeable with
+an A100 number, so the same experiment on different hardware is a different task
+rather than a duplicate to skip.
+
+**Exactly-once execution is a correctness requirement here, not an efficiency
+nicety** — two workers on the same task would contend for the same disk and
+pollute the I/O measurement being taken. Guarantees:
+
+- **Atomic claim.** One conditional `UPDATE ... WHERE status='pending'`; the
+  loser of a race sees `rowcount == 0` and moves on. Portable across Postgres
+  and SQLite, so the identical code path is unit-tested locally.
+- **Epoch fencing.** A session paused past its lease can wake up and try to
+  commit. Every claim bumps `epoch`, and `complete()` writes only
+  `WHERE epoch = :mine`, so a zombie's write affects 0 rows and is rejected
+  loudly instead of clobbering the live worker's result.
+- **Lease reclamation.** A pre-empted worker's task returns to the pool after
+  `COLDSTART_LEASE_TIMEOUT_S` (default 1800s, comfortably longer than a 7B pull).
+  On Colab this is the normal case, not the exception.
+- **LPT scheduling.** Biggest checkpoint claimed first, so the slowest job never
+  lands at the end of the run with the fleet idle behind it.
+- **Workers wait, they don't quit.** An empty *pending* queue is not a finished
+  run — another worker may hold the last task, and if it is pre-empted the task
+  comes back. Workers poll (with jitter) until every task is terminal, so an
+  idle session is still there to pick up released work. `--no-wait` opts out.
+- **Non-retryable failures fail once.** A 401, 404 or unknown model key will
+  fail identically on every attempt; retrying it three times starves the queue,
+  since the biggest checkpoint is claimed first. These park as `failed`
+  immediately. `coldstart-fleet retry` re-queues them once you've fixed the cause.
+- **Staging is cleared between tasks.** The storage experiment copies the whole
+  checkpoint per tier; two copies of a 7.6 GiB model plus the HF cache is a third
+  of a Colab disk, and the next task would die on an ENOSPC that looks like
+  anything but "out of room".
+
+Triage a stalled run with:
+
+```bash
+coldstart-fleet status          # counts, plus the error line for each failure
+coldstart-fleet retry           # return failed tasks to the queue
+```
+
+### No gated models
+
+Every model in the registry is ungated — nothing needs an HF token or an
+accepted licence. `meta-llama/*` repos were removed deliberately: a 401 is not
+transient, and because tasks are ordered longest-checkpoint-first, a large gated
+model gets re-claimed ahead of real work on every pass. Ungated Qwen, SmolLM2
+and Phi models cover the same size classes.
+
+Credentials come from the environment and are never hardcoded:
+
+```python
+import os, getpass
+os.environ["COLDSTART_DB_URL"] = getpass.getpass("DB URL: ")
+```
+
+`getpass` keeps the string out of saved notebook output. Paste the URL exactly as
+Neon gives it — `normalise_db_url()` adds the psycopg2 driver, drops
+`channel_binding` (libpq-version dependent, and psycopg2 rejects it) and keeps
+`sslmode=require`.
+
+> The coordinator is a port of one built for a distributed OTFS/ISAC optimisation
+> pipeline. The concurrency semantics are domain-agnostic; only the task identity
+> and payload changed.
+
+## Publishing results
+
+Turn a fleet's ledger into a Hugging Face dataset -- flattened observations, the
+raw ledger, the analysis, and a dataset card whose headline numbers are filled
+in from the data rather than typed by hand:
+
+Results can come from a file or straight from the shared ledger, which matters
+when a distributed run's output only ever lived in Postgres:
+
+```bash
+export HF_TOKEN=hf_...
+python scripts/publish_to_hf.py \
+    --from-db \
+    --repo-id your-username/llm-cold-start-benchmark \
+    --code-url https://github.com/your-username/coldstart-lab \
+    --dry-run          # build locally and inspect first
+```
+
+`observations.csv` carries one row per (model, experiment, condition), joined to
+checkpoint size, parameter count, shard count and family, plus a `reliable`
+column that is `False` where relative standard deviation is 30% or more. Noisy
+rows are published rather than dropped -- a reader may pick a different
+threshold -- but nothing in the analysis rests on them.
 
 ## Tests
 
 ```bash
-pytest tests/ -q
+pytest             # 41 fast CPU tests, no network, no services
+pytest -m network  # adds one real tiny-model download
 ```
 
-Coverage is concentrated on the parts that actually break: the percentile/summary
-math, the load-curve fit and extrapolation, and the worker-output JSON parsing
-(which has to find one JSON line amid whatever torch/transformers print to stdout).
+The concurrency tests spawn **real OS processes hammering one database**, because
+lost updates, double-claims and zombie writes do not reproduce single-threaded.
+They run against SQLite by default and against Postgres when pointed at one:
+
+```bash
+COLDSTART_TEST_DB_URL=postgresql://... pytest tests/test_coordinator_race.py
+```
+
+Running both matters: Postgres returns tz-**aware** `now()` while `heartbeat_at`
+is tz-**naive**, and subtracting them raises `TypeError`. SQLite returns naive for
+both, so that bug is invisible locally and only detonates on the real backend.
+`test_timezone_mismatch` pins the normalisation directly.
+
+## Repository layout
+
+```
+src/coldstart_lab/
+  timing.py          high-resolution phase timing
+  environment.py     system fingerprint + page-cache control
+  models.py          the model registry
+  fetch.py           HF checkpoint fetch (weights/config/tokenizer only)
+  loaders/           safetensors / bin loaders + converter
+  experiments/       format / storage / engine + stats base
+  extrapolate.py     MiB/s -> production load-time projection
+  report.py          JSON + Markdown + optional charts
+  cli.py             end-to-end orchestrator
+  distributed/       Postgres work ledger, worker loop, fleet CLI
+notebooks/           Colab drivers (single-machine + fleet worker)
+scripts/             multi-model sweep
+tests/               pytest suite
+```
+
+## Scope and honesty
+
+This is a measurement and analysis tool, not a claim to have reimplemented a
+production platform's cold-start path. It cannot replicate driver-level
+checkpoint/restore (e.g. proprietary GPU memory snapshotting) without that
+infrastructure; where a technique is out of reach on a free runtime, the harness
+measures the closest honest proxy and says so in the report.
+
+## License
+
+Apache-2.0.

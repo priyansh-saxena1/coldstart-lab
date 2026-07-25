@@ -1,11 +1,15 @@
-# core (CPU-runnable). versions match what's tested; transformers 5.x renamed the
-# load dtype kwarg to `dtype`, so <5 will break the worker.
-torch>=2.2
-transformers>=5,<6
-safetensors
-huggingface_hub
-numpy
+# Core runtime dependencies. GPU + plotting extras are intentionally optional
+# so the harness installs and its tests pass on a plain CPU box.
+torch>=2.1
+transformers>=4.40
+safetensors>=0.4
+huggingface_hub>=0.23
 
-# GPU-only extras live in [gpu] in pyproject.toml: accelerate, bitsandbytes, vllm.
-# install those in Colab, not here — bitsandbytes has no CPU wheel worth having and
-# vllm pulls a large CUDA stack.
+# Distributed fleet (pip install "coldstart-lab[distributed]")
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+
+# Optional (install as needed):
+#   pip install vllm         # GPU engine experiment
+#   pip install matplotlib   # report plots
+#   pip install pytest       # test suite
